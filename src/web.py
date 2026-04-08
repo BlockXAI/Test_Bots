@@ -1,6 +1,7 @@
 import os
 import json
 import glob
+import html
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
@@ -83,6 +84,17 @@ def _report_metrics(data):
         slowest.extend(report.get("results", []))
     slowest = sorted(slowest, key=lambda x: x.get("elapsed_ms", 0), reverse=True)[:3]
     return total_scripts, passed_scripts, failed_scripts, total_endpoints, passed_endpoints, slowest
+
+
+def _pretty_json(value):
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, str):
+            return html.escape(value)
+        return html.escape(json.dumps(value, indent=2, sort_keys=True, default=str))
+    except Exception:
+        return html.escape(str(value))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -185,13 +197,36 @@ async def view_report(report_id: str):
             blocks += f"<p class='mono-link'>{report.get('server', '')}</p>"
             blocks += f"<div class='progress-shell'><div class='progress-bar {tone}' style='width:{report.get('passed', 0) / max(report.get('total_tests', 1), 1) * 100:.0f}%'></div></div>"
             blocks += f"<p class='report-stats'>{report.get('passed', 0)}/{report.get('total_tests', 0)} passed · {report.get('pass_rate', '?')} · {report.get('total_time_ms', 0)}ms total</p>"
-            blocks += "<table class='report-table compact'><thead><tr><th></th><th>Method</th><th>Endpoint</th><th>Time</th><th>Detail</th></tr></thead><tbody>"
+            blocks += "<table class='report-table compact'><thead><tr><th></th><th>Method</th><th>Endpoint</th><th>Time</th><th>Detail</th><th>Payloads</th></tr></thead><tbody>"
             for item in report.get("results", []):
                 status = item.get("status", False)
                 row_class = "healthy" if status else "degraded"
-                detail = str(item.get("detail", ""))
+                detail = html.escape(str(item.get("detail", "")))
                 detail = detail[:160] + "..." if len(detail) > 160 else detail
-                blocks += f"<tr class='{row_class}'><td>{'✅' if status else '❌'}</td><td><code>{item.get('method', '?')}</code></td><td><code>{item.get('endpoint', '?')[:56]}</code></td><td>{item.get('elapsed_ms', 0)}ms</td><td class='detail'>{detail}</td></tr>"
+                method = html.escape(str(item.get('method', '?')))
+                endpoint = html.escape(str(item.get('endpoint', '?')))
+                request_blob = _pretty_json(item.get('request'))
+                response_blob = _pretty_json(item.get('response'))
+                response_headers_blob = _pretty_json(item.get('response_headers'))
+                traces = item.get('traces') or []
+                trace_html = ""
+                if traces:
+                    trace_parts = []
+                    for idx, trace in enumerate(traces, start=1):
+                        trace_parts.append(
+                            f"<details class='trace-block'><summary>Trace {idx}: {html.escape(str(trace.get('method', '?')))} {html.escape(str(trace.get('endpoint', '?')))}</summary>"
+                            f"<div class='payload-grid'><div><div class='payload-label'>Request</div><pre>{_pretty_json(trace.get('request'))}</pre></div>"
+                            f"<div><div class='payload-label'>Response</div><pre>{_pretty_json(trace.get('response'))}</pre></div></div></details>"
+                        )
+                    trace_html = "".join(trace_parts)
+                payloads = (
+                    "<details class='payload-block'><summary>View full input/output</summary>"
+                    f"<div class='payload-grid'><div><div class='payload-label'>Request</div><pre>{request_blob or 'No request body recorded.'}</pre></div>"
+                    f"<div><div class='payload-label'>Response</div><pre>{response_blob or 'No response body recorded.'}</pre></div></div>"
+                    f"<div class='payload-label'>Response Headers</div><pre>{response_headers_blob or 'No response headers recorded.'}</pre>"
+                    f"{trace_html}</details>"
+                )
+                blocks += f"<tr class='{row_class}'><td>{'✅' if status else '❌'}</td><td><code>{method}</code></td><td><code>{endpoint[:56]}</code></td><td>{item.get('elapsed_ms', 0)}ms</td><td class='detail'>{detail}</td><td class='payload-cell'>{payloads}</td></tr>"
             blocks += "</tbody></table>"
         else:
             stderr = (result.get("stderr") or "").strip()
@@ -258,6 +293,12 @@ def _page_template(title, body):
         .report-table.compact tr.degraded td {{ background:rgba(253,236,234,0.45); }}
         code {{ background:var(--warm); border:1px solid var(--sand); border-radius:6px; padding:2px 6px; font-size:12px; color:var(--ink); }}
         .detail {{ max-width:420px; word-break:break-word; }}
+        .payload-cell {{ min-width:320px; }}
+        .payload-block, .trace-block {{ border:1px solid var(--sand); border-radius:12px; background:rgba(255,255,255,0.6); padding:8px 10px; }}
+        .payload-block summary, .trace-block summary {{ cursor:pointer; color:var(--green); font-weight:600; }}
+        .payload-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-top:10px; }}
+        .payload-label {{ font-family:'DM Mono', monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.08em; color:var(--ghost); margin:8px 0 6px; }}
+        .payload-block pre, .trace-block pre {{ background:#221d19; color:#f6efe7; border-radius:10px; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-size:12px; max-height:340px; }}
         .error-box {{ background:#221d19; color:#f7d5cd; border-radius:16px; padding:18px; overflow:auto; font-size:12px; white-space:pre-wrap; }}
         @media (max-width: 768px) {{ .hero,.panel {{ padding:24px 16px; }} .panel-head {{ flex-direction:column; }} .detail {{ max-width:220px; }} }}
     </style>

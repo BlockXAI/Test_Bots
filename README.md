@@ -8,18 +8,20 @@ This project is used as an internal reliability layer for live products.
  
 It does three jobs:
  
-- **Execute e2e test scripts** from the `scripts/` directory
+- **Execute e2e test scripts** from the `scripts/` directory (sequentially, one-by-one)
+- **Require structured JSON reports** from every script (no fallback generation)
 - **Send clean summaries to Telegram** for the internal team
-- **Host full detailed reports** on the web dashboard for deeper debugging
+- **Host full detailed reports** on the web dashboard with complete request/response payloads
+- **Log all script output** to server logs for real-time debugging
  
 This is intended for post-deploy monitoring, scheduled health checks, and quick triage when production services degrade.
  
 ## High-Level Flow
  
 1. A script in `scripts/` runs against a live product
-2. The script exits with `0` for success or non-zero for failure
-3. The script optionally writes a structured JSON report
-4. `runner.py` collects results and stores a run report in `reports/`
+2. The script **must** emit a valid structured JSON report
+3. `runner.py` validates the JSON report (fails the script if missing/invalid)
+4. Results are stored in `reports/` and optionally in PostgreSQL
 5. `reporter.py` formats a Telegram-friendly summary
 6. `web.py` exposes the full report at `/report/<report_id>`
 7. The bot posts a summary + report link to the Telegram group
@@ -28,14 +30,16 @@ This is intended for post-deploy monitoring, scheduled health checks, and quick 
  
 ```
 Test_Bots/
-├── scripts/               # Product-specific e2e test scripts
-│   └── joyo_cc.py         # Example production API e2e script
+├── scripts/               # Product-specific e2e test scripts (executed)
+│   ├── growstreams.py     # Example: API e2e with full lifecycle tests
+│   ├── nist_rmf.py        # Example: Multi-service RMF compliance suite
+│   └── *_impl.py          # Helper modules (NOT executed directly)
 ├── src/
-│   ├── runner.py          # Discovers scripts, runs them, saves reports
+│   ├── runner.py          # Discovers scripts, runs them, logs output, validates JSON
 │   ├── reporter.py        # Builds Telegram summary/debug messages
 │   ├── telegram_bot.py    # Telegram command handlers
-│   ├── scheduler.py       # Scheduled execution logic
-│   └── web.py             # FastAPI dashboard for full test reports
+│   ├── scheduler.py       # Scheduled execution (startup + cron, non-overlapping)
+│   └── web.py             # FastAPI dashboard with request/response payloads
 ├── reports/               # Saved JSON run reports
 ├── config.py              # Central env/config loading
 ├── main.py                # Starts dashboard + bot + scheduler
@@ -149,21 +153,42 @@ Requirements for every script:
 - **Must be executable with Python directly**
 - **Must return exit code `0` on success**
 - **Must return non-zero on failure**
-- **Should write a JSON result file** if you want rich Telegram and dashboard details
+- **Must write a valid JSON report file** (`<script_name>_results.json`) — the runner will fail the script if this is missing or malformed
+- **Should include request/response payloads** for full debugging in the dashboard
  
 Recommended structure:
  
-- **[config]** base URL and any test constants
-- **[helpers]** request helpers, log function, asset builders
-- **[tests]** endpoint-level functions
-- **[summary]** final JSON file output
-- **[main]** orchestrates execution and returns correct exit code
+```python
+scripts/
+├── my_product.py              # Entrypoint (thin wrapper)
+└── my_product_v3_impl.py       # Implementation (helper, not executed)
+```
+
+**Entrypoint pattern** (keeps `scripts/` clean):
+```python
+#!/usr/bin/env python3
+from my_product_v3_impl import main as run_impl
+import sys
+if __name__ == "__main__":
+    sys.exit(run_impl())
+```
+
+**Implementation structure**:
+- **[config]** base URL, constants, feature flags
+- **[helpers]** request wrapper that captures request/response/headers/timing
+- **[tests]** endpoint-level test functions
+- **[report builder]** produces bot-native JSON with all required fields
+- **[main]** orchestrates execution, writes JSON report, returns exit code
+
+**Note**: Files ending in `_impl.py` are automatically excluded from script discovery.
  
-## JSON Report Contract
- 
-If the script writes structured JSON, the bot can show failed endpoints, timings, and richer debugging details.
- 
-Recommended output shape:
+## JSON Report Contract (Required)
+
+Every script **must** emit a valid JSON report. The runner will reject scripts that don't produce one.
+
+**Required report file**: `<script_name>_results.json` in the same directory as the script.
+
+**Required output shape**:
  
 ```json
 {
@@ -193,12 +218,17 @@ Recommended output shape:
 }
 ```
  
-Optional useful keys:
- 
-- **`tx_hash`** for blockchain/NFT flows
-- **`test_user`** when scripts create temporary users
-- **`test_plant`** or other generated entities
-- **service-specific IDs** that help debugging after a failure
+Optional but recommended keys:
+
+- **`request`** — full request payload {url, headers, body}
+- **`response`** — full response body (JSON or string)
+- **`response_headers`** — response headers dict
+- **`traces`** — array of all API calls made during a multi-step test
+- **`is_known_bug`** — boolean flag for server-side issues (won't count as failure)
+- **`section`** — logical grouping (e.g., "Health", "Tokens", "Streams")
+- **`tx_hash`** — for blockchain/NFT flows
+- **`test_user`** — when scripts create temporary users
+- **service-specific IDs** — that help debugging after a failure
  
 ## Report Storage and Debugging
  
@@ -356,28 +386,45 @@ Check:
 - dependency versions
 - file path assumptions
 - generated temp files
+
+Also check **server logs** — the runner now streams script output:
+```
+2026-04-09 05:01:12 [INFO] e2e_bot.runner: Starting script: growstreams
+2026-04-09 05:01:13 [INFO] e2e_bot.runner: [growstreams][stdout] ✅ [PASS] GET /health
+2026-04-09 05:01:14 [WARNING] e2e_bot.runner: [growstreams][stderr] rate limit hit
+```
  
 ## Recommendations for New Scripts
  
 To keep reports consistent across all products:
  
-- **[name scripts clearly]** use product-style names like `joyo_cc.py`, `wallet_api.py`, `growth_panel.py`
+- **[name scripts clearly]** use product-style names like `growstreams.py`, `nist_rmf.py`
+- **[use the helper module pattern]** put implementation in `*_impl.py`, keep entrypoint thin
 - **[track timing]** include `elapsed_ms` for every endpoint
+- **[capture full payloads]** include request/response/headers for dashboard debugging
 - **[log enough detail]** include status code, key response fields, and useful IDs
-- **[avoid secrets]** never dump tokens or credentials in details
+- **[avoid secrets]** never dump tokens or credentials in details or logs
 - **[clean test data]** if a script creates entities, use time-based IDs
 - **[be deterministic]** avoid flaky behavior where possible
+- **[emit valid JSON]** the runner will reject your script if the report is missing
  
 ## Recommended Next Improvements
  
-Good future upgrades for the internal team:
- 
+These have been implemented:
+
+- ✅ **[structured reports required]** scripts must emit valid JSON
+- ✅ **[full payload visibility]** request/response/headers shown in dashboard
+- ✅ **[server-side logging]** all script output piped to application logs
+- ✅ **[non-overlapping runs]** scheduler prevents concurrent execution
+- ✅ **[known bug tracking]** `is_known_bug` flag for server-side issues
+
+Good future upgrades:
+
 - **[trend comparison]** compare against previous run
 - **[latency alerts]** mark endpoints that are slow even if they pass
 - **[deployment metadata]** attach commit SHA, deploy time, and environment
 - **[ownership mapping]** map scripts to product owners
 - **[severity routing]** send major failures to the group, minor ones to admin-only channels
-- **[artifacts]** attach stdout/stderr snippets and additional payload context
  
 ## Quick Commands Reference
  

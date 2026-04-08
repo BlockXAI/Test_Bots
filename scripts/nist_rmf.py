@@ -41,6 +41,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 
+RESULTS_FILE = os.path.join(os.path.dirname(__file__), "nist_rmf_results.json")
+
+
 # =============================================================================
 # TERMINAL COLORS
 # =============================================================================
@@ -194,6 +197,11 @@ class TestResult:
     details: str = ""
     data: Optional[Dict[str, Any]] = None
     dur_s: float = 0.0
+    method: str = "SCRIPT"
+    endpoint: str = "nist_rmf"
+    status_code: Optional[int] = None
+    warn: bool = False
+    skip: bool = False
 
 
 @dataclass
@@ -221,17 +229,50 @@ class Client:
         self.base = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self.traces: List[Dict[str, Any]] = []
 
     def call(self, method: str, path: str, *, json_data: dict = None, params: dict = None, timeout: int = 120) -> Tuple[int, dict]:
         url = f"{self.base}{path}"
         try:
             resp = self.session.request(method, url, json=json_data, params=params, timeout=timeout)
             try:
-                return resp.status_code, resp.json()
+                data = resp.json()
             except Exception:
-                return resp.status_code, {"raw": resp.text[:1000]}
+                data = {"raw": resp.text[:1000]}
+            self.traces.append(
+                {
+                    "method": method,
+                    "endpoint": path,
+                    "url": url,
+                    "request": {
+                        "params": params,
+                        "body": json_data,
+                        "headers": dict(self.session.headers),
+                    },
+                    "response": data,
+                    "response_headers": dict(resp.headers),
+                    "status_code": resp.status_code,
+                }
+            )
+            return resp.status_code, data
         except Exception as e:
-            return 0, {"error": str(e), "url": url}
+            data = {"error": str(e), "url": url}
+            self.traces.append(
+                {
+                    "method": method,
+                    "endpoint": path,
+                    "url": url,
+                    "request": {
+                        "params": params,
+                        "body": json_data,
+                        "headers": dict(self.session.headers),
+                    },
+                    "response": data,
+                    "response_headers": {},
+                    "status_code": 0,
+                }
+            )
+            return 0, data
 
 
 class Suite:
@@ -246,6 +287,22 @@ class Suite:
         self.agent_clients: Dict[str, Client] = {}
         for key, url in AGENT_URLS.items():
             self.agent_clients[key] = Client(url)
+
+    def _all_clients(self) -> List[Client]:
+        clients = [self.rmf, self.controlhub, self.proofs]
+        if self.autodoc:
+            clients.append(self.autodoc)
+        clients.extend(self.agent_clients.values())
+        return clients
+
+    def _trace_marks(self) -> List[int]:
+        return [len(client.traces) for client in self._all_clients()]
+
+    def _collect_new_traces(self, marks: List[int]) -> List[Dict[str, Any]]:
+        traces: List[Dict[str, Any]] = []
+        for client, mark in zip(self._all_clients(), marks):
+            traces.extend(client.traces[mark:])
+        return traces
 
     # -------------------------
     # Logging + result handling
@@ -262,15 +319,41 @@ class Suite:
 
     def run_test(self, name: str, fn, *args, **kwargs) -> Tuple[bool, Any]:
         start = time.time()
+        marks = self._trace_marks()
         try:
             out = fn(*args, **kwargs)
             dur = time.time() - start
-            self.results.append(TestResult(name=name, passed=True, dur_s=dur))
+            traces = self._collect_new_traces(marks)
+            primary = traces[0] if traces else {}
+            self.results.append(
+                TestResult(
+                    name=name,
+                    passed=True,
+                    dur_s=dur,
+                    data={"traces": traces},
+                    method=primary.get("method", "SCRIPT"),
+                    endpoint=primary.get("endpoint", name),
+                    status_code=primary.get("status_code"),
+                )
+            )
             print(f"  {C.GREEN}[PASS]{C.RESET} {name} ({dur:.1f}s)")
             return True, out
         except Exception as e:
             dur = time.time() - start
-            self.results.append(TestResult(name=name, passed=False, details=str(e), dur_s=dur))
+            traces = self._collect_new_traces(marks)
+            primary = traces[-1] if traces else {}
+            self.results.append(
+                TestResult(
+                    name=name,
+                    passed=False,
+                    details=str(e),
+                    dur_s=dur,
+                    data={"traces": traces},
+                    method=primary.get("method", "SCRIPT"),
+                    endpoint=primary.get("endpoint", name),
+                    status_code=primary.get("status_code"),
+                )
+            )
             print(f"  {C.RED}[FAIL]{C.RESET} {name} ({dur:.1f}s) :: {str(e)}")
             return False, None
 
@@ -1616,11 +1699,12 @@ class Suite:
             self.run_test("Agent: PEA Extract (Policy Extraction)", self.step_agent_pea_extract, ctx)
             self.run_test("Agent: PEA Enforce (Policy Enforcement)", self.step_agent_pea_enforce, ctx)
             self.run_test("Agent: RWA (Regulatory Web)", self.step_agent_rwa, ctx)
-            self.run_test("Agent: VCA (Vuln & Commit Analysis)", self.step_agent_vca, ctx)
+            self.run_test("Agent: VCA (Vulnerability Analysis)", self.step_agent_vca, ctx)
             self.run_test("Agent: DID/VC Service", self.step_agent_did_vc, ctx)
             self.run_test("Agent: FAA (Framework Alignment)", self.step_agent_faa, ctx)
-            self.run_test("Agent: Crosswalk (Framework Mapping)", self.step_agent_crosswalk, ctx)
+            self.run_test("Agent: Crosswalk", self.step_agent_crosswalk, ctx)
 
+        self.write_report()
         self._summary()
         failed = sum(1 for r in self.results if not r.passed)
         return 0 if failed == 0 else 1
@@ -1643,6 +1727,54 @@ class Suite:
         else:
             print(f"\n{C.GREEN}{C.BOLD}✅ ALL TESTS PASSED{C.RESET}")
         print(f"{'='*80}\n")
+
+    def build_report(self) -> Dict[str, Any]:
+        total = len(self.results)
+        passed = sum(1 for r in self.results if r.passed and not r.warn and not r.skip)
+        failed = sum(1 for r in self.results if not r.passed and not r.skip)
+        total_time_ms = int(sum(r.dur_s for r in self.results) * 1000)
+        pass_rate = f"{(passed / total * 100):.1f}%" if total else "0.0%"
+        report_results = []
+        for item in self.results:
+            traces = (item.data or {}).get("traces") or []
+            primary = traces[-1] if traces else {}
+            report_results.append(
+                {
+                    "name": item.name,
+                    "section": "RMF",
+                    "status": item.passed or item.warn or item.skip,
+                    "warn": item.warn,
+                    "skip": item.skip,
+                    "method": item.method,
+                    "endpoint": item.endpoint,
+                    "status_code": item.status_code,
+                    "detail": item.details or ("PASS" if item.passed else "FAIL"),
+                    "elapsed_ms": int(item.dur_s * 1000),
+                    "request": primary.get("request"),
+                    "response": primary.get("response"),
+                    "response_headers": primary.get("response_headers"),
+                    "trace_count": len(traces),
+                    "traces": traces,
+                }
+            )
+        return {
+            "server": self.rmf.base,
+            "generated_at": now_iso(),
+            "suite": "CompliLedger RMF E2E Suite",
+            "total_tests": total,
+            "passed": passed,
+            "failed": failed,
+            "warnings": 0,
+            "skipped": 0,
+            "pass_rate": pass_rate,
+            "total_time_ms": total_time_ms,
+            "success": failed == 0,
+            "results": report_results,
+        }
+
+    def write_report(self):
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(self.build_report(), f, indent=2, default=str)
 
 
 def main():
