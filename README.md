@@ -1,4 +1,4 @@
-# E2E Test Bot
+# Chinku: Your 24*7 production monitoring and Debugger Buddy
  
 Automated monitoring bot that runs Python e2e scripts on a schedule, posts summaries to Telegram, and hosts full HTML reports for debugging.
  
