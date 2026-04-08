@@ -1,8 +1,10 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from config import SCHEDULE_HOURS, NOTIFY_ON_SUCCESS
 from src.runner import run_all_scripts
@@ -13,10 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 def setup_scheduler(app):
-    """
-    Configure APScheduler to run all e2e tests at the configured hours (UTC).
-    `app` is the Telegram Application instance used to send reports.
-    """
     scheduler = AsyncIOScheduler()
 
     async def scheduled_run():
@@ -31,6 +29,15 @@ def setup_scheduler(app):
 
         status = "PASS" if run_summary["all_passed"] else "FAIL"
         logger.info(f"Scheduled run complete: {status}")
+
+    first_run_at = datetime.now() + timedelta(seconds=60)
+    scheduler.add_job(
+        scheduled_run,
+        DateTrigger(run_date=first_run_at),
+        id="e2e_startup_run",
+        replace_existing=True,
+    )
+    logger.info(f"Initial test run scheduled at {first_run_at.strftime('%H:%M:%S')} (60s from now)")
 
     for hour in SCHEDULE_HOURS:
         trigger = CronTrigger(hour=hour, minute=0, timezone="UTC")

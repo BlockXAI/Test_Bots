@@ -4,7 +4,6 @@ from config import TIMEZONE
 
 
 def _tz_offset():
-    """Get timezone offset for display. Supports Asia/Kolkata as a common case."""
     offsets = {
         "Asia/Kolkata": timedelta(hours=5, minutes=30),
         "UTC": timedelta(0),
@@ -16,50 +15,102 @@ def _tz_offset():
 
 
 def _local_time():
-    return datetime.now(timezone(_tz_offset())).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return datetime.now(timezone(_tz_offset())).strftime("%d %b %Y, %I:%M %p IST")
+
+
+def _format_ms(ms):
+    if ms >= 1000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms}ms"
+
+
+def _health_bar(passed, total):
+    if total == 0:
+        return ""
+    filled = round((passed / total) * 10)
+    return "\u2588" * filled + "\u2591" * (10 - filled)
 
 
 def build_summary_message(run_summary):
-    """Build a Telegram-ready summary message from run results."""
     total = run_summary["total_scripts"]
     passed = run_summary.get("passed_scripts", sum(1 for r in run_summary["results"] if r["success"]))
     failed = run_summary.get("failed_scripts", sum(1 for r in run_summary["results"] if not r["success"]))
     all_ok = run_summary["all_passed"]
 
-    icon = "\u2705" if all_ok else "\u274c"
-    header = f"{icon} *E2E Test Report*\n"
-    header += f"\U0001f552 {_local_time()}\n"
-    header += f"\U0001f4ca Scripts: {total} | Pass: {passed} | Fail: {failed}\n"
-    header += "\u2500" * 30 + "\n"
+    status_text = "ALL SYSTEMS OPERATIONAL" if all_ok else f"{failed} SERVICE(S) DEGRADED"
+    status_icon = "\u2705" if all_ok else "\U0001f6a8"
 
-    body_lines = []
+    msg = f"{status_icon} *{status_text}*\n"
+    msg += f"\U0001f4c5 {_local_time()}\n\n"
+
     for r in run_summary["results"]:
-        s_icon = "\u2705" if r["success"] else "\u274c"
-        line = f"{s_icon} *{r['script']}* — {r['duration_s']}s"
+        report = r.get("report")
+        script_name = r["script"].replace("_", " ").title()
 
+        if r["success"]:
+            s_icon = "\u2705"
+        else:
+            s_icon = "\u274c"
+
+        msg += f"{s_icon} *{script_name}*\n"
+
+        if report:
+            server = report.get("server", "")
+            t = report.get("total_tests", 0)
+            p = report.get("passed", 0)
+            f_ = report.get("failed", 0)
+            rate = report.get("pass_rate", "?")
+            total_ms = report.get("total_time_ms", 0)
+
+            if server:
+                msg += f"   \U0001f310 `{server}`\n"
+            msg += f"   {_health_bar(p, t)}  {p}/{t} passed ({rate})\n"
+            msg += f"   \u23f1 Total: {_format_ms(total_ms)}\n"
+
+            if report.get("results"):
+                passed_tests = [x for x in report["results"] if x.get("status")]
+                slowest = sorted(passed_tests, key=lambda x: x.get("elapsed_ms", 0), reverse=True)[:3]
+                if slowest:
+                    slow_parts = [f"`{x['method']} {x['endpoint'][:25]}` {_format_ms(x['elapsed_ms'])}" for x in slowest]
+                    msg += f"   \U0001f422 Slowest: {', '.join(slow_parts)}\n"
+
+                if f_ > 0:
+                    failed_tests = [x for x in report["results"] if not x.get("status")]
+                    msg += f"\n   \u26a0\ufe0f *{f_} Failed endpoint(s):*\n"
+                    for ft in failed_tests:
+                        endpoint = ft.get("endpoint", "?")
+                        method = ft.get("method", "?")
+                        detail = ft.get("detail", "")
+                        elapsed = ft.get("elapsed_ms", 0)
+                        msg += f"   \u2022 `{method} {endpoint}`\n"
+                        msg += f"     {_format_ms(elapsed)} — {_truncate(detail, 120)}\n"
+        else:
+            stderr = r.get("stderr", "").strip()
+            if stderr:
+                msg += f"   ```\n{_truncate(stderr, 300)}\n```\n"
+            else:
+                msg += f"   \u23f1 {r['duration_s']}s — Script crashed or timed out\n"
+
+        msg += "\n"
+
+    msg += f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    msg += f"\U0001f4ca *{passed}/{total}* scripts green | "
+
+    total_endpoints = 0
+    total_passed_endpoints = 0
+    for r in run_summary["results"]:
         report = r.get("report")
         if report:
-            t = report.get("total_tests", "?")
-            p = report.get("passed", "?")
-            f_ = report.get("failed", "?")
-            server = report.get("server", "")
-            line += f"\n   {p}/{t} tests passed"
-            if server:
-                line += f" | `{server}`"
+            total_endpoints += report.get("total_tests", 0)
+            total_passed_endpoints += report.get("passed", 0)
 
-        body_lines.append(line)
-
-    msg = header + "\n".join(body_lines)
-
-    if not all_ok:
-        msg += "\n\n\u26a0\ufe0f *Failures:*\n"
-        msg += build_failure_details(run_summary)
+    if total_endpoints > 0:
+        msg += f"*{total_passed_endpoints}/{total_endpoints}* endpoints healthy"
 
     return msg
 
 
 def build_failure_details(run_summary):
-    """Build detailed failure info for debugging."""
     lines = []
     for r in run_summary["results"]:
         if r["success"]:
@@ -75,55 +126,71 @@ def build_failure_details(run_summary):
                 method = t.get("method", "?")
                 detail = t.get("detail", "no detail")
                 elapsed = t.get("elapsed_ms", "?")
-                lines.append(f"  \u2022 `{method} {endpoint}` ({elapsed}ms)")
-                lines.append(f"    _{_truncate(detail, 200)}_")
+                lines.append(f"  \u2022 `{method} {endpoint}` ({_format_ms(elapsed)})")
+                lines.append(f"    {_truncate(detail, 200)}")
         else:
             stderr = r.get("stderr", "").strip()
             if stderr:
-                lines.append(f"  ```\n{_truncate(stderr, 500)}\n```")
+                lines.append(f"  ```\n{_truncate(stderr, 400)}\n```")
             else:
-                stdout_tail = r.get("stdout", "").strip()[-500:]
+                stdout_tail = r.get("stdout", "").strip()[-400:]
                 if stdout_tail:
                     lines.append(f"  ```\n{stdout_tail}\n```")
-                else:
-                    lines.append("  _No output captured_")
 
     return "\n".join(lines)
 
 
 def build_single_script_message(result):
-    """Build a report message for a single script run."""
+    script_name = result["script"].replace("_", " ").title()
     s_icon = "\u2705" if result["success"] else "\u274c"
-    msg = f"{s_icon} *{result['script']}*\n"
-    msg += f"\U0001f552 {_local_time()} | Duration: {result['duration_s']}s\n"
+    msg = f"{s_icon} *{script_name}*\n"
+    msg += f"\U0001f4c5 {_local_time()}\n\n"
 
     report = result.get("report")
     if report:
-        t = report.get("total_tests", "?")
-        p = report.get("passed", "?")
-        f_ = report.get("failed", "?")
-        rate = report.get("pass_rate", "?")
         server = report.get("server", "")
-        msg += f"\U0001f4ca {p}/{t} passed ({rate})"
-        if server:
-            msg += f" | `{server}`"
-        msg += "\n"
+        t = report.get("total_tests", 0)
+        p = report.get("passed", 0)
+        f_ = report.get("failed", 0)
+        rate = report.get("pass_rate", "?")
+        total_ms = report.get("total_time_ms", 0)
 
-        failed_tests = [r for r in report.get("results", []) if not r.get("status")]
-        if failed_tests:
-            msg += "\n\u26a0\ufe0f *Failed endpoints:*\n"
-            for ft in failed_tests:
-                endpoint = ft.get("endpoint", "?")
-                method = ft.get("method", "?")
-                detail = ft.get("detail", "")
-                elapsed = ft.get("elapsed_ms", "?")
-                msg += f"  \u2022 `{method} {endpoint}` ({elapsed}ms)\n"
-                msg += f"    _{_truncate(detail, 150)}_\n"
+        if server:
+            msg += f"\U0001f310 `{server}`\n"
+        msg += f"{_health_bar(p, t)}  {p}/{t} passed ({rate})\n"
+        msg += f"\u23f1 Total: {_format_ms(total_ms)}\n"
+
+        if report.get("results"):
+            passed_tests = [x for x in report["results"] if x.get("status")]
+            if passed_tests:
+                avg_ms = sum(x.get("elapsed_ms", 0) for x in passed_tests) // len(passed_tests)
+                msg += f"\U0001f4c8 Avg response: {_format_ms(avg_ms)}\n"
+
+            slowest = sorted(passed_tests, key=lambda x: x.get("elapsed_ms", 0), reverse=True)[:3]
+            if slowest:
+                msg += f"\n\U0001f422 *Slowest endpoints:*\n"
+                for x in slowest:
+                    msg += f"  \u2022 `{x['method']} {x['endpoint'][:30]}` — {_format_ms(x['elapsed_ms'])}\n"
+
+            if f_ > 0:
+                failed_tests = [x for x in report["results"] if not x.get("status")]
+                msg += f"\n\U0001f6a8 *{f_} Failed:*\n"
+                for ft in failed_tests:
+                    endpoint = ft.get("endpoint", "?")
+                    method = ft.get("method", "?")
+                    detail = ft.get("detail", "")
+                    elapsed = ft.get("elapsed_ms", 0)
+                    msg += f"  \u274c `{method} {endpoint}`\n"
+                    msg += f"     {_format_ms(elapsed)} — {_truncate(detail, 150)}\n"
+            else:
+                msg += f"\n\u2705 All endpoints healthy"
     else:
         if not result["success"]:
             stderr = result.get("stderr", "").strip()
             if stderr:
-                msg += f"```\n{_truncate(stderr, 500)}\n```"
+                msg += f"```\n{_truncate(stderr, 400)}\n```"
+            else:
+                msg += f"Script crashed after {result['duration_s']}s"
 
     return msg
 
