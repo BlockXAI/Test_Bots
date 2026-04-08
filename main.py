@@ -1,10 +1,15 @@
 import asyncio
 import logging
 import sys
+import threading
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SCHEDULE_HOURS
+import uvicorn
+
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SCHEDULE_HOURS, WEB_PORT, BASE_URL
 from src.telegram_bot import build_application
 from src.scheduler import setup_scheduler
+from src.storage import init_db
+from src.web import app as web_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,6 +17,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("e2e_bot")
+
+
+def run_web_server():
+    uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="warning")
 
 
 def main():
@@ -23,14 +32,20 @@ def main():
         logger.warning("TELEGRAM_CHAT_ID is not set. Bot will run but scheduled reports won't be sent.")
 
     logger.info(f"Starting E2E Test Bot")
+    logger.info(f"Dashboard: {BASE_URL}")
     logger.info(f"Scheduled runs at UTC hours: {SCHEDULE_HOURS}")
+    init_db()
 
-    app = build_application()
-    scheduler = setup_scheduler(app)
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logger.info(f"Web dashboard running on port {WEB_PORT}")
+
+    tg_app = build_application()
+    scheduler = setup_scheduler(tg_app)
     scheduler.start()
 
     logger.info("Bot is live. Listening for commands and running on schedule.")
-    app.run_polling(drop_pending_updates=True)
+    tg_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

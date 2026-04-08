@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 
 from config import SCRIPTS_DIR, REPORTS_DIR
+from src.storage import save_report
 
 
 def discover_scripts():
@@ -130,7 +131,8 @@ def run_all_scripts():
         "all_passed": all_passed,
     }
 
-    _save_run_report(run_summary)
+    report_id = _save_run_report(run_summary)
+    run_summary["report_id"] = report_id
     return run_summary
 
 
@@ -140,14 +142,19 @@ def run_script_by_name(name):
     if not os.path.isfile(script_path):
         return None
     result = run_single_script(script_path)
-    _save_run_report({"ran_at": result["ran_at"], "total_scripts": 1, "results": [result], "all_passed": result["success"]})
+    summary = {"ran_at": result["ran_at"], "total_scripts": 1, "results": [result], "all_passed": result["success"]}
+    report_id = _save_run_report(summary)
+    result["report_id"] = report_id
     return result
 
 
 def _save_run_report(summary):
-    """Persist run report to the reports directory."""
+    """Persist run report to the reports directory. Returns the report_id."""
     os.makedirs(REPORTS_DIR, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(REPORTS_DIR, f"run_{ts}.json")
+    report_id = f"run_{ts}"
+    path = os.path.join(REPORTS_DIR, f"{report_id}.json")
     with open(path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
+    save_report(report_id, summary)
+    return report_id

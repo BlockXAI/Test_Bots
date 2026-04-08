@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 
-from config import TIMEZONE
+from config import TIMEZONE, BASE_URL
 
 
 def _tz_offset():
@@ -37,7 +37,7 @@ def build_summary_message(run_summary):
     failed = run_summary.get("failed_scripts", sum(1 for r in run_summary["results"] if not r["success"]))
     all_ok = run_summary["all_passed"]
 
-    status_text = "ALL SYSTEMS OPERATIONAL" if all_ok else f"{failed} SERVICE(S) DEGRADED"
+    status_text = "Everything looks healthy and happy" if all_ok else f"Heads up — {failed} service(s) need attention"
     status_icon = "\u2705" if all_ok else "\U0001f6a8"
 
     msg = f"{status_icon} *{status_text}*\n"
@@ -94,7 +94,6 @@ def build_summary_message(run_summary):
         msg += "\n"
 
     msg += f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-    msg += f"\U0001f4ca *{passed}/{total}* scripts green | "
 
     total_endpoints = 0
     total_passed_endpoints = 0
@@ -104,8 +103,19 @@ def build_summary_message(run_summary):
             total_endpoints += report.get("total_tests", 0)
             total_passed_endpoints += report.get("passed", 0)
 
+    msg += f"\U0001f4ca *{passed}/{total}* scripts passing"
     if total_endpoints > 0:
-        msg += f"*{total_passed_endpoints}/{total_endpoints}* endpoints healthy"
+        msg += f" | *{total_passed_endpoints}/{total_endpoints}* endpoints healthy"
+    msg += "\n"
+
+    report_id = run_summary.get("report_id")
+    if report_id:
+        msg += f"\n\U0001f517 [Full Report]({BASE_URL}/report/{report_id})"
+
+    if all_ok:
+        msg += "\n\n\U0001f389 Nice! The bot did a clean sweep this run."
+    else:
+        msg += "\n\n\U0001f9ef I pinned the failing endpoints above so your team can debug faster."
 
     return msg
 
@@ -191,6 +201,15 @@ def build_single_script_message(result):
                 msg += f"```\n{_truncate(stderr, 400)}\n```"
             else:
                 msg += f"Script crashed after {result['duration_s']}s"
+
+    report_id = result.get("report_id")
+    if report_id:
+        msg += f"\n\n\U0001f517 [Full Report]({BASE_URL}/report/{report_id})"
+
+    if result["success"]:
+        msg += "\n\n\U0001f389 This product looks good right now."
+    else:
+        msg += "\n\n\U0001f527 A few things look off — full details are linked above."
 
     return msg
 
